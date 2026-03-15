@@ -1,0 +1,7 @@
+---
+title: "main R"
+author: "Sihui Lin"
+date: "2026-03-15"
+output: pdf_document
+---
+
