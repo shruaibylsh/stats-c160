@@ -5,3 +5,39 @@ date: "2026-03-15"
 output: pdf_document
 ---
 
+# 1 Data Loading
+```{r}
+Sys.setenv(RICU_DATA_PATH = "/Users/shruaibylsh/Desktop/stats c160/stats-c160/mimic-iv-2.2")
+library(ricu)
+
+import_src("miiv", tables = c(
+  "patients", "admissions", "icustays",
+  "omr","labevents", "chartevents", "d_items", 
+  "diagnoses_icd", "d_icd_diagnoses", "services"
+))
+```
+
+Load Libraries:
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+```{r}
+sofa <- load_concept("sofa", src = "miiv")
+```
+
+
+
+# 2 
+```{r}
+
+```
+
+
+# 3
+```{r}
+
+```
+
