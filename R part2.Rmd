@@ -1,0 +1,376 @@
+---
+title: "R part 2"
+author: "Sihui Lin"
+date: "2026-03-20"
+output: pdf_document
+---
+
+# Setup
+```{r setup, message=FALSE, warning=FALSE}
+library(faircause)
+library(xgboost)
+library(data.table)
+library(ggplot2)
+library(EValue)
+
+set.seed(2026)
+```
+
+
+# Patch xgboost compatibility (helper)
+```{r patch-xgb}
+# xgboost >= 1.7 can return best_iteration = integer(0), causing
+# "argument is of length zero" inside faircause. Patch both internal functions.
+
+.cv_xgb_fixed <- function(df, y, weights = NULL, ...) {
+  dtrain <- xgboost::xgb.DMatrix(data = as.matrix(df), label = y,
+                                   weight = weights)
+  binary <- all(y %in% c(0, 1))
+  params <- if (binary) list(objective = "binary:logistic", eval_metric = "logloss")
+            else        list(objective = "reg:squarederror", eval_metric = "rmse")
+  cv <- xgboost::xgb.cv(params = params, data = dtrain, nrounds = 500, nfold = 5,
+                          early_stopping_rounds = 10, prediction = TRUE,
+                          verbose = FALSE)
+  best_iter <- cv$best_iteration
+  if (length(best_iter) == 0L || best_iter <= 0L) best_iter <- 50L
+  xgb <- xgboost::xgb.train(params = params, data = dtrain,
+                              nrounds = best_iter, verbose = FALSE)
+  attr(xgb, "binary") <- binary
+  xgb
+}
+
+.pred_xgb_fixed <- function(xgb, df_test, intervention = NULL, X = "X") {
+  if (!is.null(intervention)) df_test[[X]] <- intervention
+  dtest <- xgboost::xgb.DMatrix(data = as.matrix(df_test))
+  preds <- predict(xgb, dtest)
+  if (is.matrix(preds) && ncol(preds) == 2L) preds <- preds[, 2L]
+  as.vector(preds)
+}
+
+utils::assignInNamespace("cv_xgb",   .cv_xgb_fixed,   ns = "faircause")
+utils::assignInNamespace("pred_xgb", .pred_xgb_fixed, ns = "faircause")
+```
+
+
+# Prepare data
+```{r prep}
+dat_anal <- copy(dat)
+
+sofa_med <- median(dat_anal$sofa, na.rm = TRUE)
+dat_anal[is.na(sofa), sofa := sofa_med]
+cat("Sofa imputed:", sum(is.na(dat$sofa)), "rows → median =", sofa_med, "\n")
+
+dat_anal[, sex_int := as.integer(sex) - 1L]
+
+dat_anal[, age_grp := fcase(
+  age >= 18 & age < 50, "18-49",
+  age >= 50 & age < 70, "50-69",
+  age >= 70,            "70+",
+  default = NA_character_
+)]
+dat_anal[, age_grp := factor(age_grp, levels = c("18-49", "50-69", "70+"))]
+
+X <- "bmi_binary"
+Y <- "death"
+W <- "sofa"
+Z <- c("age", "sex_int", "elix_score")
+
+cat("N:", nrow(dat_anal), "\n")
+cat("Outcome rate:", round(mean(dat_anal$death), 3), "\n")
+cat("BMI groups:\n");  print(table(dat_anal$bmi_binary))
+cat("Age groups:\n");  print(table(dat_anal$age_grp))
+```
+
+
+# Helper
+```{r helper}
+fcb_data <- function(dt, X, Z, W = NULL, Y) {
+  cols <- c(X, Z, if (!is.null(W)) W, Y)
+  d <- as.data.frame(dt[, ..cols])
+  d[complete.cases(d), ]
+}
+```
+
+
+# Decomposition: TV, xDE, xIE, xSE
+```{r decomp}
+d   <- fcb_data(dat_anal, X, Z, W, Y)
+
+fcb <- fairness_cookbook(data = d, X = X, Z = Z, W = W, Y = Y, x0 = 0L, x1 = 1L)
+
+lbl <- c(tv = "TV", ctfde = "xDE", ctfie = "xIE", ctfse = "xSE")
+m   <- as.data.table(fcb$measures)[measure %in% names(lbl)]
+m[, label := lbl[measure]]
+m[, lo    := value - 1.96 * sd]
+m[, hi    := value + 1.96 * sd]
+m[, pp    := sprintf("%+.2f percent  [%+.2f, %+.2f]", 100*value, 100*lo, 100*hi)]
+print(m[, .(label, pp)])
+```
+
+```{r decomp-plot, fig.width=7, fig.height=4.5, fig.align="center"}
+autoplot(fcb) +
+  labs(
+    title = "Causal decomposition of mortality difference: BMI effect",
+    y     = "Mortality difference (%)"
+  ) +
+  theme_minimal() +
+  scale_x_discrete(
+    labels = c("Total\nVariation", "Direct\nEffect",
+               "Indirect\nEffect", "Spurious\nEffect"),
+    name = "Pathway"
+  ) +
+  scale_fill_discrete(
+    labels = c("Total Variation", "Direct Effect",
+               "Indirect Effect", "Spurious Effect"),
+    name = "Pathway"
+  )
+```
+
+
+# Figure 2: Confounder distributions by BMI group
+```{r fig2-confounders, fig.width=9, fig.height=4, fig.align="center"}
+# Two side-by-side density panels: age and elix_score
+conf_long <- melt(
+  dat_anal,
+  id.vars      = "bmi_binary",
+  measure.vars = c("age", "elix_score"),
+  variable.name = "covariate",
+  value.name    = "value"
+)
+conf_long[, panel := c(age = "(a) Age (years)",
+                        elix_score = "(b) Elixhauser Score")[covariate]]
+conf_long[, bmi_label := factor(bmi_binary, levels = c(0L, 1L),
+                                 labels = c("Normal weight", "Overweight/Obese"))]
+
+ggplot(conf_long, aes(x = value, fill = bmi_label)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_discrete(name = NULL) +
+  facet_wrap(~panel, scales = "free", nrow = 1) +
+  labs(
+    title = "Confounder distributions by BMI group",
+    x     = NULL,
+    y     = "Density"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 13),
+    legend.position = "bottom",
+    strip.text      = element_text(face = "bold")
+  )
+```
+
+
+# Figure 3: Age-adjusted SOFA distributions by BMI group
+```{r fig3-sofa, fig.width=7, fig.height=4.5, fig.align="center"}
+mc_age_adjust <- function(dt, n_mc = 1e5) {
+  dt  <- copy(dt)
+  dt[, age_r := as.integer(round(age))]
+  avs <- sort(unique(dt$age_r))
+
+  lkp <- setNames(lapply(avs, function(a) list(
+    `0` = which(dt$age_r == a & dt$bmi_binary == 0L),
+    `1` = which(dt$age_r == a & dt$bmi_binary == 1L)
+  )), as.character(avs))
+
+  for (grp in c("0", "1")) {
+    for (a in avs) {
+      k <- as.character(a)
+      if (length(lkp[[k]][[grp]]) == 0L) {
+        for (ca in avs[order(abs(avs - a))][-1]) {
+          if (length(lkp[[as.character(ca)]][[grp]]) > 0L) {
+            lkp[[k]][[grp]] <- lkp[[as.character(ca)]][[grp]]; break
+          }
+        }
+      }
+    }
+  }
+
+  ag <- sample(dt$age_r, n_mc, replace = TRUE)
+  rbindlist(lapply(c(0L, 1L), function(grp) {
+    gs   <- as.character(grp)
+    rows <- unlist(lapply(unique(ag), function(a)
+      sample(lkp[[as.character(a)]][[gs]], sum(ag == a), replace = TRUE)))
+    dt[rows]
+  }))
+}
+
+adj_dat <- mc_age_adjust(dat_anal, n_mc = 1e5)
+print(adj_dat[, .(mean_sofa = round(mean(sofa), 2),
+                  median_sofa = median(sofa), n = .N), by = bmi_binary])
+
+adj_dat[, bmi_label := factor(bmi_binary, levels = c(0L, 1L),
+                               labels = c("Normal weight", "Overweight/Obese"))]
+
+ggplot(adj_dat, aes(x = sofa, fill = bmi_label)) +
+  geom_histogram(position = "identity", alpha = 0.5, colour = "black", binwidth = 1) +
+  scale_fill_discrete(name = NULL) +
+  labs(
+    title = "Age-adjusted SOFA score distribution by BMI group",
+    x     = "SOFA score at 24 h",
+    y     = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 13),
+    legend.position = "bottom"
+  )
+```
+
+
+# Figures 4: Heterogeneity heatmaps (x-DE)
+```{r subgroup}
+sg_grid <- CJ(
+  age_grp  = levels(dat_anal$age_grp),
+  adm_type = levels(dat_anal$adm_type)
+)
+
+sg_res <- rbindlist(lapply(seq_len(nrow(sg_grid)), function(i) {
+  ag <- sg_grid$age_grp[i]
+  at <- sg_grid$adm_type[i]
+
+  sub <- dat_anal[age_grp == ag & adm_type == at]
+  d   <- fcb_data(sub, X, Z, W, Y)
+  n   <- nrow(d)
+  ev0 <- sum(d[[X]] == 0L & d[[Y]] == 1L)
+  ev1 <- sum(d[[X]] == 1L & d[[Y]] == 1L)
+
+  out <- data.table(age_grp = ag, adm_type = at, n = n,
+                    DE = NA_real_, DE_sd = NA_real_,
+                    IE = NA_real_, IE_sd = NA_real_)
+
+  if (n < 50 || (ev0 + ev1) < 10) {
+    message(sprintf("Skip %s × %s: n=%d ev0=%d ev1=%d total_ev=%d",
+                    ag, at, n, ev0, ev1, ev0 + ev1))
+    return(out)
+  }
+
+  f <- tryCatch(
+    fairness_cookbook(data = d, X = X, Z = Z, W = W, Y = Y, x0 = 0L, x1 = 1L),
+    error = function(e) { message(ag, " × ", at, ": ", e$message); NULL }
+  )
+  if (is.null(f)) return(out)
+
+  out$DE    <- f$measures$value[f$measures$measure == "ctfde"]
+  out$DE_sd <- f$measures$sd[f$measures$measure == "ctfde"]
+  out
+}))
+
+# Factor ordering for axes
+sg_res[, age_grp  := factor(age_grp,  levels = c("18-49", "50-69", "70+"))]
+sg_res[, adm_type := factor(adm_type,
+                              levels = c("medical", "elective_surgical",
+                                         "nonelective_surgical"),
+                              labels = c("Medical", "Surgical\n(Elective)",
+                                         "Surgical\n(Non-elective)"))]
+
+cat("\nSubgroup result table:\n")
+print(sg_res[, .(age_grp, adm_type, n,
+                  DE  = sprintf("%+.2f ± %.2f", 100*DE,  100*DE_sd))])
+```
+
+```{r plt-heatmap-fn}
+plt_heatmap <- function(sg, eff, sd_col, ttl, flip_color = FALSE) {
+  d <- copy(sg)
+  d[, effect := get(eff)]
+  d[, s      := get(sd_col)]
+  d[, opa    := fcase(
+    !is.na(effect) & !is.na(s) & abs(effect / s) > 2, 1.0,
+    !is.na(effect) & !is.na(s) & abs(effect / s) > 1, 0.6,
+    !is.na(effect),                                     0.3,
+    default = 0.15
+  )]
+  d[, label := ifelse(
+    is.na(effect) & n == 0, "no data",
+    ifelse(
+      is.na(effect),
+      paste0("n = ", n, "\n0 deaths"),
+      paste0(round(effect * 100, 1), "%\n[",
+             round((effect - 1.96 * s) * 100, 1), "%, ",
+             round((effect + 1.96 * s) * 100, 1), "%]")
+    )
+  )]
+
+  lwr <- if (flip_color) "red"  else "blue"
+  upr <- if (flip_color) "blue" else "red"
+
+  ggplot(d, aes(x = adm_type, y = age_grp, fill = effect)) +
+    geom_tile(aes(alpha = opa)) +
+    scale_fill_gradient2(low = lwr, high = upr, mid = "white",
+                         midpoint = 0,
+                         na.value = "grey88",
+                         name     = "Effect",
+                         labels   = scales::percent) +
+    geom_text(aes(label = label), colour = "black", size = 3.5) +
+    guides(alpha = "none") +
+    ggtitle(ttl) +
+    xlab("Admission type") +
+    ylab("Age group (years)") +
+    theme_minimal() +
+    theme(
+      plot.title  = element_text(hjust = 0.5, face = "bold", size = 14),
+      axis.text   = element_text(size = rel(1.1)),
+      axis.title  = element_text(size = rel(1.1))
+    )
+}
+```
+
+```{r fig4-de-heatmap, fig.width=7, fig.height=4, fig.align="center"}
+plt_heatmap(sg_res, "DE", "DE_sd", "Direct Effect (x-DE) Heterogeneity")
+```
+
+
+# Step 5a: E-value for xDE
+```{r evalue}
+de_row <- fcb$measures[fcb$measures$measure == "ctfde", ]
+de_est <- de_row$value
+de_sd  <- de_row$sd
+cat(sprintf("xDE: %+.4f  95%% CI: [%+.4f, %+.4f]\n",
+            de_est, de_est - 1.96*de_sd, de_est + 1.96*de_sd))
+
+# xDE < 0: relabel so RD > 0 (normal weight as exposed, obese as reference)
+p_ref <- mean(dat_anal$death[dat_anal$bmi_binary == 1L])
+p_exp <- max(1e-4, min(1 - 1e-4, p_ref + (-de_est)))
+n_ref <- sum(dat_anal$bmi_binary == 1L)
+n_exp <- sum(dat_anal$bmi_binary == 0L)
+
+ev <- evalues.RD(
+  n11 = round(p_exp * n_exp), n10 = n_exp - round(p_exp * n_exp),
+  n01 = round(p_ref * n_ref), n00 = n_ref - round(p_ref * n_ref),
+  true = 0
+)
+cat("\nE-value (normal weight as exposed group):\n")
+print(ev)
+```
+
+
+# Step 5b: Leave-one-out Z sensitivity
+```{r loo}
+set.seed(2026)
+loo_specs <- list(
+  full       = Z,
+  drop_age   = setdiff(Z, "age"),
+  drop_sex   = setdiff(Z, "sex_int"),
+  drop_elix  = setdiff(Z, "elix_score")
+)
+
+loo_list <- lapply(loo_specs, function(z_now) {
+  d <- fcb_data(dat_anal, X, z_now, W, Y)
+  fairness_cookbook(data = d, X = X, Z = z_now, W = W, Y = Y, x0 = 0L, x1 = 1L)
+})
+
+lbl2 <- c(tv = "TV", ctfde = "xDE", ctfie = "xIE", ctfse = "xSE")
+tbl  <- rbindlist(lapply(names(loo_list), function(nm) {
+  m2 <- loo_list[[nm]]$measures
+  m2 <- m2[m2$measure %in% names(lbl2), ]
+  data.table(
+    Spec    = nm,
+    Measure = lbl2[m2$measure],
+    Est     = sprintf("%+.2f pp", 100 * m2$value),
+    CI      = sprintf("[%+.2f, %+.2f]",
+                       100 * (m2$value - 1.96 * m2$sd),
+                       100 * (m2$value + 1.96 * m2$sd))
+  )
+}))
+
+print(tbl)
+```

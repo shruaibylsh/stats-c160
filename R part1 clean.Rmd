@@ -1,0 +1,238 @@
+---
+title: "R part 1"
+author: "Sihui Lin"
+date: "2026-03-15"
+output: pdf_document
+---
+
+
+# 1 install data
+```{r setup, message=FALSE, warning=FALSE}
+Sys.setenv(
+  RICU_DATA_PATH = "/Users/shruaibylsh/Desktop/stats c160/stats-c160/mimic-iv-2.2"
+)
+
+library(ricu)
+library(data.table)
+library(lubridate)
+library(comorbidity)
+
+attach_src("miiv", assign_env = .GlobalEnv)
+```
+
+
+# Load raw tables via ricu
+```{r load-tables, message=FALSE}
+icustays      <- as.data.table(load_src("icustays", "miiv"))
+admissions    <- as.data.table(load_src("admissions", "miiv"))
+patients      <- as.data.table(load_src("patients", "miiv"))
+omr           <- as.data.table(load_src("omr", "miiv"))
+diagnoses_icd <- as.data.table(load_src("diagnoses_icd", "miiv"))
+services      <- as.data.table(load_src("services", "miiv"))
+```
+
+
+# Step 1: Build first-ICU-stay cohort
+```{r cohort}
+setorder(icustays, subject_id, intime, stay_id)
+cohort <- icustays[, .SD[1L], by = subject_id,
+                   .SDcols = c("hadm_id", "stay_id", "intime", "outtime")]
+
+admissions_keep <- admissions[, .(hadm_id, admittime, admission_type,
+                                  admission_location, hospital_expire_flag)]
+cohort <- admissions_keep[cohort, on = "hadm_id"]
+
+patients_keep <- patients[, .(subject_id, anchor_age, anchor_year, gender)]
+cohort <- patients_keep[cohort, on = "subject_id"]
+
+cat("Cohort (first ICU stay per patient):", nrow(cohort), "stays\n")
+```
+
+
+# Step 2: BMI: binary (18.5-25, >25)
+```{r bmi}
+omr_bmi <- omr[result_name %in% c("BMI", "BMI (kg/m2)"),
+               .(subject_id,
+                 chartdate = as.IDate(chartdate),
+                 bmi_raw   = suppressWarnings(as.numeric(result_value)))]
+omr_bmi <- omr_bmi[!is.na(bmi_raw) & bmi_raw > 10 & bmi_raw < 100]
+
+# Average multiple readings on the same calendar day
+omr_bmi <- omr_bmi[, .(bmi_raw = mean(bmi_raw, na.rm = TRUE)),
+                   by = .(subject_id, chartdate)]
+setkey(omr_bmi, subject_id, chartdate)
+
+# Rolling join: most recent BMI on or before ICU admission date.
+# Rename intime to 'chartdate' so keys align; omr_bmi[lookup, roll=TRUE] picks
+# the largest chartdate in omr_bmi that is <= the lookup date, per subject_id.
+lookup <- cohort[, .(subject_id, hadm_id, stay_id, intime,
+                     chartdate = as.IDate(intime))]
+setkey(lookup, subject_id, chartdate)
+bmi_matched <- omr_bmi[lookup, roll = TRUE]
+
+bmi_matched[, bmi_binary := fcase(
+  bmi_raw >= 18.5 & bmi_raw <= 25, 0L,   # normal weight
+  bmi_raw  > 25,                   1L,   # overweight / obese
+  default  = NA_integer_                 # underweight or missing
+)]
+
+n_before <- nrow(cohort)
+bmi_matched <- bmi_matched[!is.na(bmi_binary)]
+cat("Excluded (no pre-admission BMI or BMI < 18.5):",
+    n_before - nrow(bmi_matched), "\n")
+cat("Analytic sample after BMI filter:", nrow(bmi_matched), "\n")
+cat("BMI group counts  (0 = normal weight  [18.5, 25],",
+    "1 = overweight/obese  > 25):\n")
+print(table(bmi_matched$bmi_binary))
+```
+
+
+# Step 4: SOFA at 24 h via ricu
+```{r sofa}
+sofa_raw <- load_concepts("sofa", "miiv")
+sofa_dt  <- as.data.table(sofa_raw)
+t_col    <- index_var(sofa_raw)
+
+sofa_24h <- sofa_dt[get(t_col) == as.difftime(24L, units = "hours"),
+                    .(sofa = sofa),
+                    by = stay_id]
+```
+
+
+# Step 5: Age and sex
+# Age = anchor_age + (year(admittime) - anchor_year).
+# Sex = factor(gender). Both computed in the assemble chunk below.
+
+
+# Step 6: Elixhauser comorbidity score
+```{r elixhauser}
+run_elix <- function(dx, map) {
+  comorbidity(as.data.frame(dx), id = "hadm_id", code = "icd_code",
+              map = map, assign0 = FALSE)
+}
+
+dx_cohort <- diagnoses_icd[hadm_id %in% cohort$hadm_id]
+elix10 <- run_elix(dx_cohort[icd_version == 10, .(hadm_id = as.character(hadm_id), icd_code)], "elixhauser_icd10_quan")
+elix9  <- run_elix(dx_cohort[icd_version == 9,  .(hadm_id = as.character(hadm_id), icd_code)], "elixhauser_icd9_quan")
+
+flag_cols <- setdiff(names(elix10), "hadm_id")
+elix_all  <- rbindlist(list(as.data.table(elix10), as.data.table(elix9)), fill = TRUE)
+
+# Column-wise max per hadm_id: 1 wins over 0 across ICD-9 and ICD-10
+elix_agg <- elix_all[, lapply(.SD, function(x) max(x, na.rm = TRUE)),
+                     by = hadm_id, .SDcols = flag_cols]
+
+for (col in flag_cols) {
+  idx <- which(is.infinite(elix_agg[[col]]))
+  if (length(idx)) set(elix_agg, idx, col, 0L)
+}
+
+# score() requires a 'comorbidity' S3 object — restore class and map attr
+# stripped by rbindlist/lapply before scoring.
+elix_agg_df <- as.data.frame(elix_agg)
+class(elix_agg_df)       <- c("comorbidity", "data.frame")
+attr(elix_agg_df, "map") <- "elixhauser_icd10_quan"
+
+elix_scores_vec <- score(elix_agg_df, weights = "vw", assign0 = FALSE)
+elix_scores <- data.table(hadm_id    = as.integer(elix_agg$hadm_id),
+                          elix_score = elix_scores_vec)
+cat("Elixhauser score summary:\n")
+print(summary(elix_scores$elix_score))
+```
+
+
+# Step 7: Admission type (medical / elective_surgical / nonelective_surgical)
+```{r adm-type}
+adm_info <- cohort[, .(hadm_id, admission_type, admission_location)]
+
+adm_info[, elective := fifelse(
+  admission_type %in% c("AMBULATORY OBSERVATION", "ELECTIVE") |
+    (admission_type == "DIRECT OBSERVATION" &
+       admission_location %in% c("PROCEDURE SITE", "PACU",
+                                 "AMBULATORY SURGERY TRANSFER")) |
+    (admission_type == "OBSERVATION ADMIT" &
+       admission_location %in% c("PROCEDURE_SITE", "PACU")) |
+    (admission_type == "SURGICAL SAME DAY ADMISSION" &
+       admission_location %in% c("PROCEDURE_SITE", "PACU",
+                                 "PHYSICIAN REFERRAL")),
+  1L, 0L
+)]
+
+surgical_svcs <- c("CSURG", "NSURG", "ORTHO", "SURG", "TSURG",
+                   "VSURG", "GYN", "OBS")
+
+svc_cohort <- services[hadm_id %in% cohort$hadm_id,
+                       .(hadm_id, transfertime, curr_service)]
+setorder(svc_cohort, hadm_id, transfertime)
+first_svc <- svc_cohort[, .SD[1L], by = hadm_id, .SDcols = "curr_service"]
+
+adm_type_dt <- adm_info[first_svc, on = "hadm_id"]
+adm_type_dt[, adm_type := fcase(
+  !(curr_service %in% surgical_svcs),               "medical",
+  curr_service %in% surgical_svcs & elective == 1L, "elective_surgical",
+  curr_service %in% surgical_svcs & elective == 0L, "nonelective_surgical",
+  default = NA_character_
+)]
+adm_type_dt[, adm_type := factor(adm_type,
+                                  levels = c("medical", "elective_surgical",
+                                             "nonelective_surgical"))]
+adm_type_dt <- adm_type_dt[, .(hadm_id, adm_type)]
+
+cat("Admission type distribution:\n")
+print(table(adm_type_dt$adm_type, useNA = "ifany"))
+```
+
+
+# Assemble final dataset dat
+```{r assemble}
+dat <- copy(bmi_matched[, .(subject_id, hadm_id, stay_id, intime,
+                             bmi_binary, bmi_raw)])
+
+mort_map <- cohort[, .(hadm_id, hospital_expire_flag)]
+dat[mort_map, on = "hadm_id", death := as.integer(i.hospital_expire_flag)]
+
+dat[sofa_24h, on = "stay_id", sofa := i.sofa]
+
+demog_map <- cohort[, .(hadm_id, admittime, anchor_age, anchor_year, gender)]
+dat[demog_map, on = "hadm_id",
+    `:=`(admittime   = i.admittime,
+         anchor_age  = i.anchor_age,
+         anchor_year = i.anchor_year,
+         gender      = i.gender)]
+
+dat[, age := anchor_age + (year(admittime) - anchor_year)]
+dat[, sex := factor(gender, levels = c("M", "F"))]
+dat[, c("admittime", "anchor_age", "anchor_year", "gender") := NULL]
+
+dat[elix_scores,  on = "hadm_id", elix_score := i.elix_score]
+dat[adm_type_dt,  on = "hadm_id", adm_type   := i.adm_type]
+dat[, adm_type := factor(adm_type, levels = c("medical", "elective_surgical",
+                                               "nonelective_surgical"))]
+
+setcolorder(dat, c("subject_id", "hadm_id", "stay_id", "intime",
+                   "bmi_binary", "bmi_raw",
+                   "death", "sofa",
+                   "age", "sex", "elix_score", "adm_type"))
+
+cat("Final dat:", nrow(dat), "rows x", ncol(dat), "cols\n")
+cat("Columns:", paste(names(dat), collapse = ", "), "\n")
+```
+
+
+# Summary statistics for dat
+```{r summary}
+cat("=== nrow(dat) ===\n")
+print(nrow(dat))
+
+cat("\n=== sum(is.na(.)) per column ===\n")
+print(sapply(dat, function(x) sum(is.na(x))))
+
+cat("\n=== table(dat$bmi_binary)  [0 = normal, 1 = overweight/obese] ===\n")
+print(table(dat$bmi_binary, dnn = "bmi_binary"))
+
+cat("\n=== table(dat$adm_type) ===\n")
+print(table(dat$adm_type, useNA = "ifany"))
+
+cat("\n=== mean(dat$death) ===\n")
+print(mean(dat$death, na.rm = TRUE))
+```
